@@ -9,19 +9,16 @@ import { domainToCategory, toHostname } from '@/src/lib/reports';
 export const config = { api: { bodyParser: false } };
 
 type ChromeHistoryRow = {
-  // CSV format from Chrome History export
   order?: string | number;
   id?: string | number;
-  date?: string; // e.g., "10/1/2025"
-  time?: string; // e.g., "1:33:56"
+  date?: string;
+  time?: string;
   title?: string;
   url?: string;
   visitCount?: string | number;
   typedCount?: string | number;
   transition?: string;
-  // JSON format (Chrome WebExtensions API)
   visitTime?: number;
-  // Generic fallback format
   last_visit_time?: string;
   visit_count?: string | number;
 };
@@ -39,8 +36,6 @@ function parseForm(req: NextApiRequest) {
 }
 
 function parseDateTime(date: string, time: string): Date {
-  // Handle formats like "10/1/2025" and "1:33:56"
-  // or "10/1/2025" and "01:33:56"
   try {
     const dateTimeStr = `${date} ${time}`;
     const parsed = new Date(dateTimeStr);
@@ -49,7 +44,6 @@ function parseDateTime(date: string, time: string): Date {
       return parsed;
     }
 
-    // Try parsing manually if native parsing fails
     const [month, day, year] = date.split('/').map(Number);
     const timeParts = time.split(':');
     const hour = parseInt(timeParts[0]);
@@ -73,7 +67,6 @@ export default async function handler(
   try {
     const { files } = await parseForm(req);
 
-    // Handle formidable v3 array format
     const fileArray = files.file as
       | formidable.File
       | formidable.File[]
@@ -110,86 +103,74 @@ export default async function handler(
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 14);
 
-    let inserted = 0;
-    let skipped = 0;
-    const errors: { row: number; reason: string }[] = [];
+    // Deduplicate by URL + timestamp to avoid counting the same visit multiple times
+    const seen = new Set<string>();
+    const uniqueRows: Array<ChromeHistoryRow & { visitedAt: Date }> = [];
 
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-
-      // Extract URL
+    for (const row of rows) {
       const url = row.url?.trim();
-      if (!url || url === '') {
-        errors.push({ row: i, reason: 'Missing URL' });
-        skipped++;
+      if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
         continue;
       }
 
-      // Skip invalid URLs
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        errors.push({ row: i, reason: 'Invalid URL protocol' });
-        skipped++;
-        continue;
-      }
-
-      // Extract visit time from various formats
       let visitedAt: Date;
 
       if (row.visitTime) {
-        // Chrome JSON format: milliseconds since epoch or microseconds
         const timestamp = row.visitTime;
-        // Chrome uses microseconds since Jan 1, 1601, we need milliseconds since Jan 1, 1970
         if (timestamp > 10000000000000) {
-          // Likely Chrome's microseconds format
-          const CHROME_EPOCH_OFFSET = 11644473600000; // milliseconds between 1601 and 1970
+          const CHROME_EPOCH_OFFSET = 11644473600000;
           visitedAt = new Date(timestamp / 1000 - CHROME_EPOCH_OFFSET);
         } else {
           visitedAt = new Date(timestamp);
         }
       } else if (row.date && row.time) {
-        // CSV format: separate date and time columns
         visitedAt = parseDateTime(row.date, row.time);
       } else if (row.last_visit_time) {
-        // Generic format
         visitedAt = new Date(row.last_visit_time);
       } else {
-        errors.push({ row: i, reason: 'Missing timestamp' });
-        skipped++;
         continue;
       }
 
-      // Validate date
-      if (isNaN(visitedAt.getTime())) {
-        errors.push({ row: i, reason: 'Invalid date' });
-        skipped++;
+      if (isNaN(visitedAt.getTime()) || visitedAt < cutoff) {
         continue;
       }
 
-      // Skip items older than cutoff (14 days)
-      if (visitedAt < cutoff) {
-        skipped++;
-        continue;
+      // Create unique key: URL + rounded timestamp (to nearest minute)
+      const roundedTime = new Date(visitedAt);
+      roundedTime.setSeconds(0, 0);
+      const uniqueKey = `${url}|${roundedTime.toISOString()}`;
+
+      if (seen.has(uniqueKey)) {
+        continue; // Skip duplicate
       }
 
-      // Extract domain
-      const domain = toHostname(url);
+      seen.add(uniqueKey);
+      uniqueRows.push({ ...row, visitedAt });
+    }
+
+    console.log(
+      `Deduplicated: ${rows.length} → ${uniqueRows.length} unique entries`
+    );
+
+    let inserted = 0;
+    let skipped = 0;
+
+    for (const row of uniqueRows) {
+      const domain = toHostname(row.url!);
       if (!domain) {
-        errors.push({ row: i, reason: 'Invalid domain' });
         skipped++;
         continue;
       }
 
-      // Extract visit count
-      const visits = Number(row.visitCount || row.visit_count || 1) || 1;
-
-      // Categorize
+      // For more accurate analytics, count each row as 1 visit
+      // instead of using the cumulative visitCount from Chrome
+      const visits = 1;
       const category = domainToCategory(domain, row.title || '');
 
-      // Insert into database
       const { error } = await supabase.from('browser_history_items').insert({
         owner: user.id,
-        visited_at: visitedAt.toISOString(),
-        url: url,
+        visited_at: row.visitedAt.toISOString(),
+        url: row.url!,
         title: row.title?.trim() || null,
         domain,
         visits,
@@ -199,24 +180,18 @@ export default async function handler(
       if (!error) {
         inserted++;
       } else {
-        console.error(`Insert error at row ${i}:`, error);
-        errors.push({ row: i, reason: error.message });
+        console.error('Insert error:', error.message);
         skipped++;
       }
     }
 
-    console.log(
-      `Processed: ${rows.length} total, ${inserted} inserted, ${skipped} skipped`
-    );
-
-    if (errors.length > 0 && errors.length <= 10) {
-      console.log('Sample errors:', errors);
-    }
+    console.log(`Result: ${inserted} inserted, ${skipped} skipped`);
 
     res.status(200).json({
       inserted,
       skipped,
       total: rows.length,
+      unique: uniqueRows.length,
       cutoffDate: cutoff.toISOString(),
     });
   } catch (error) {
